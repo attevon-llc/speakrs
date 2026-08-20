@@ -62,15 +62,21 @@ impl TrainingEmbeddings {
         embeddings: &ChunkEmbeddings,
         plda: &PldaTransform,
         config: &PipelineConfig,
-    ) -> ChunkSpeakerClusters {
+    ) -> (ChunkSpeakerClusters, Array2<f32>) {
         if self.0.nrows() < 2 {
             let mut clusters =
                 Array2::<i32>::zeros((segmentations.0.shape()[0], segmentations.0.shape()[2]));
             mark_inactive_speakers(&segmentations.0, &mut clusters);
-            return ChunkSpeakerClusters(clusters);
+            let embedding_dim = self.0.shape().get(1).copied().unwrap_or(256);
+            return (
+                ChunkSpeakerClusters(clusters),
+                Array2::<f32>::zeros((0, embedding_dim)),
+            );
         }
 
+        let stage_t0 = std::time::Instant::now();
         let ahc_labels = cluster_ahc(&self.0.view(), config.ahc);
+        let ahc_ms = stage_t0.elapsed().as_millis();
         debug!(
             rows = self.0.nrows(),
             cols = self.0.ncols(),
@@ -85,14 +91,18 @@ impl TrainingEmbeddings {
             }
         }
 
+        let stage_t1 = std::time::Instant::now();
         let plda_features = plda.transform(&self.0.view(), 128);
+        let plda_ms = stage_t1.elapsed().as_millis();
         let phi = plda.phi();
+        let stage_t2 = std::time::Instant::now();
         let (gamma, pi): (Array2<f32>, ndarray::Array1<f32>) = cluster_vbx(
             &ahc_labels,
             &plda_features.view(),
             &phi.slice(s![..128]),
             &config.vbx,
         );
+        let vbx_ms = stage_t2.elapsed().as_millis();
 
         debug!(?pi, "VBx speaker priors");
 
@@ -123,15 +133,26 @@ impl TrainingEmbeddings {
             debug!(cluster = cluster_idx, norm, "centroid");
         }
 
+        let stage_t3 = std::time::Instant::now();
         let mut clusters = assign_chunk_embeddings(segmentations, embeddings, &centroids);
         mark_inactive_speakers(&segmentations.0, &mut clusters);
+        tracing::debug!(
+            ahc_ms,
+            plda_ms,
+            vbx_ms,
+            assign_ms = stage_t3.elapsed().as_millis(),
+            "clustering stage timing"
+        );
         debug!(
             rows = clusters.nrows(),
             cols = clusters.ncols(),
             "hard_clusters shape"
         );
 
-        ChunkSpeakerClusters(clusters)
+        // diar-native patch: return the gamma-weighted (un-normalized) centroids —
+        // row index == cluster id used in hard_clusters — for speaker-identification
+        // consumers (e.g. cross-file speaker matching via vector search).
+        (ChunkSpeakerClusters(clusters), centroids)
     }
 }
 
