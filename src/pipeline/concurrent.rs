@@ -44,6 +44,17 @@ struct MultiMaskBatch<'a> {
     chunk_indices: &'a [usize],
 }
 
+// diar-native patch: one prepared multimask batch, owned so it can cross the
+// fbank-stage / GPU-stage boundary of the pipelined runner.
+#[cfg(not(feature = "coreml"))]
+struct MultiMaskJob<'aud> {
+    audio_slices: Vec<&'aud [f32]>,
+    flat_masks: Vec<f32>,
+    mask_stride: usize,
+    active_flags: Vec<bool>,
+    chunk_indices: Vec<usize>,
+}
+
 pub(super) struct ConcurrentEmbeddingRunner<'a> {
     pub powerset: &'a PowersetMapping,
     pub audio: &'a [f32],
@@ -139,6 +150,201 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
         self.finalize(seg_array, emb_array, chunk_idx, total_windows)
     }
 
+    /// Pipelined multimask runner (diar-native patch): fbank (CPU) and multimask predict
+    /// (GPU) run as a two-stage pipeline instead of back-to-back per batch.
+    ///
+    /// Measured sequentially on a 66-min file the consumer spent 16.1 s in fbank and
+    /// 11.9 s in GPU predict, strictly alternating — the GPU idled through every fbank
+    /// batch. `clone_shared()` gives the fbank stage its own scratch buffers while the ORT
+    /// sessions stay shared, so the math, the batch boundaries, and the flush order are
+    /// exactly the sequential path's — outputs are identical by construction.
+    #[cfg(not(feature = "coreml"))]
+    pub fn run_multi_mask(
+        &self,
+        receiver: crossbeam_channel::Receiver<Array2<f32>>,
+        embedding_model: &mut EmbeddingModel,
+        batch_size: usize,
+        min_num_samples: usize,
+    ) -> Result<ConcurrentEmbeddingResult, PipelineError> {
+        let total_windows = self.total_windows();
+        let mut seg_array: Option<Array3<f32>> = None;
+        let mut num_frames: Option<usize> = None;
+
+        let mut fbank_model = embedding_model
+            .clone_shared()
+            .map_err(PipelineError::Ort)?;
+
+        let (job_tx, job_rx) = crossbeam_channel::bounded::<MultiMaskJob<'_>>(1);
+        let (fbank_tx, fbank_rx) =
+            crossbeam_channel::bounded::<(MultiMaskJob<'_>, Vec<Array2<f32>>)>(1);
+
+        let mut audio_buffer: Vec<&[f32]> = Vec::with_capacity(batch_size);
+        let mask_capacity = batch_size * self.num_speakers;
+        let mut flat_masks: Vec<f32> = Vec::new();
+        let mut active_flags: Vec<bool> = Vec::with_capacity(mask_capacity);
+        let mut chunk_indices: Vec<usize> = Vec::with_capacity(batch_size);
+        let mut chunk_idx = 0usize;
+
+        let mut total_recv_wait_us = 0u64;
+        let mut total_decode_us = 0u64;
+
+        let (fbank_result, gpu_result) = std::thread::scope(|scope| {
+            let fbank_handle = scope.spawn(move || -> Result<u64, PipelineError> {
+                let mut fbank_us = 0u64;
+                for job in &job_rx {
+                    let fbank_start = std::time::Instant::now();
+                    let fbanks = fbank_model.compute_chunk_fbanks_batch(&job.audio_slices)?;
+                    fbank_us += fbank_start.elapsed().as_micros() as u64;
+                    if fbank_tx.send((job, fbanks)).is_err() {
+                        break; // GPU stage died; its join reports the error
+                    }
+                }
+                Ok(fbank_us)
+            });
+
+            let gpu_handle = scope.spawn(
+                move || -> Result<(Option<Array3<f32>>, u64, u32), PipelineError> {
+                    let mut emb_array: Option<Array3<f32>> = None;
+                    let mut gpu_us = 0u64;
+                    let mut flushes = 0u32;
+                    for (job, fbanks) in &fbank_rx {
+                        let emb = emb_array.get_or_insert_with(|| {
+                            Array3::from_elem((total_windows, self.num_speakers, 256), f32::NAN)
+                        });
+                        let predict_start = std::time::Instant::now();
+                        self.embed_multi_mask_and_store(
+                            embedding_model,
+                            &MultiMaskBatch {
+                                audio_slices: &job.audio_slices,
+                                flat_masks: &job.flat_masks,
+                                mask_stride: job.mask_stride,
+                                active_flags: &job.active_flags,
+                                chunk_indices: &job.chunk_indices,
+                            },
+                            &fbanks,
+                            &mut Array3Writer(emb),
+                        )?;
+                        gpu_us += predict_start.elapsed().as_micros() as u64;
+                        flushes += 1;
+                    }
+                    Ok((emb_array, gpu_us, flushes))
+                },
+            );
+
+            // Stage A (this thread): decode windows, build batches, feed the pipeline.
+            loop {
+                let recv_start = std::time::Instant::now();
+                let raw_window = match receiver.recv() {
+                    Ok(w) => w,
+                    Err(_) => break,
+                };
+                total_recv_wait_us += recv_start.elapsed().as_micros() as u64;
+
+                let decode_start = std::time::Instant::now();
+                let decoded = self.powerset.hard_decode(&raw_window);
+
+                let nf = *num_frames.get_or_insert(decoded.nrows());
+                let seg = seg_array
+                    .get_or_insert_with(|| Array3::zeros((total_windows, nf, self.num_speakers)));
+                if flat_masks.is_empty() {
+                    flat_masks.resize(mask_capacity * nf, 0.0);
+                }
+
+                seg.slice_mut(s![chunk_idx, .., ..]).assign(&decoded);
+                drop(decoded);
+
+                let seg_view = seg.slice(s![chunk_idx, .., ..]);
+                let chunk_audio = chunk_audio_raw(
+                    self.audio,
+                    self.step_samples,
+                    self.window_samples,
+                    chunk_idx,
+                );
+                audio_buffer.push(chunk_audio);
+                chunk_indices.push(chunk_idx);
+
+                let mask_base = (audio_buffer.len() - 1) * self.num_speakers;
+                for speaker_idx in 0..self.num_speakers {
+                    let slot = mask_base + speaker_idx;
+                    let offset = slot * nf;
+                    let dest = &mut flat_masks[offset..offset + nf];
+                    let active = write_speaker_mask_to_slice(
+                        &seg_view,
+                        speaker_idx,
+                        chunk_audio.len(),
+                        min_num_samples,
+                        dest,
+                    );
+                    active_flags.push(active);
+                }
+                total_decode_us += decode_start.elapsed().as_micros() as u64;
+
+                if audio_buffer.len() == batch_size {
+                    let job = MultiMaskJob {
+                        audio_slices: std::mem::replace(
+                            &mut audio_buffer,
+                            Vec::with_capacity(batch_size),
+                        ),
+                        flat_masks: std::mem::replace(
+                            &mut flat_masks,
+                            vec![0.0; mask_capacity * nf],
+                        ),
+                        mask_stride: nf,
+                        active_flags: std::mem::replace(
+                            &mut active_flags,
+                            Vec::with_capacity(mask_capacity),
+                        ),
+                        chunk_indices: std::mem::replace(
+                            &mut chunk_indices,
+                            Vec::with_capacity(batch_size),
+                        ),
+                    };
+                    if job_tx.send(job).is_err() {
+                        break; // pipeline died; the joins below carry the error
+                    }
+                }
+                chunk_idx += 1;
+            }
+
+            if !audio_buffer.is_empty() {
+                if let Some(nf) = num_frames {
+                    let _ = job_tx.send(MultiMaskJob {
+                        audio_slices: audio_buffer,
+                        flat_masks,
+                        mask_stride: nf,
+                        active_flags,
+                        chunk_indices,
+                    });
+                }
+            }
+            drop(job_tx); // close the pipeline so both stages drain and exit
+
+            let fbank_result = fbank_handle.join().map_err(|_| PipelineError::WorkerPanic {
+                worker: "multimask fbank".to_owned(),
+            });
+            let gpu_result = gpu_handle.join().map_err(|_| PipelineError::WorkerPanic {
+                worker: "multimask gpu".to_owned(),
+            });
+            (fbank_result, gpu_result)
+        });
+
+        let total_fbank_us = fbank_result??;
+        let (emb_array, total_gpu_predict_us, flush_count) = gpu_result??;
+
+        trace!(
+            flushes = flush_count,
+            chunks = chunk_idx,
+            recv_wait_ms = total_recv_wait_us / 1000,
+            decode_ms = total_decode_us / 1000,
+            fbank_ms = total_fbank_us / 1000,
+            gpu_predict_ms = total_gpu_predict_us / 1000,
+            "Multi-mask embedding timing (pipelined)"
+        );
+
+        self.finalize(seg_array, emb_array, chunk_idx, total_windows)
+    }
+
+    #[cfg(feature = "coreml")]
     pub fn run_multi_mask(
         &self,
         receiver: crossbeam_channel::Receiver<Array2<f32>>,
@@ -270,6 +476,7 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
         self.finalize(seg_array, emb_array, chunk_idx, total_windows)
     }
 
+    #[cfg(feature = "coreml")]
     fn flush_multi_mask_flat<S: EmbeddingStorage>(
         &self,
         embedding_model: &mut EmbeddingModel,
@@ -280,6 +487,22 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
         let fbanks = embedding_model.compute_chunk_fbanks_batch(batch.audio_slices)?;
         let fbank_us = fbank_start.elapsed().as_micros() as u64;
 
+        let predict_start = std::time::Instant::now();
+        self.embed_multi_mask_and_store(embedding_model, batch, &fbanks, storage)?;
+        let predict_us = predict_start.elapsed().as_micros() as u64;
+
+        Ok((fbank_us, predict_us))
+    }
+
+    /// Predict embeddings for one prepared batch (fbanks already computed) and write the
+    /// active rows into `storage` — shared by the sequential and pipelined runners.
+    fn embed_multi_mask_and_store<S: EmbeddingStorage>(
+        &self,
+        embedding_model: &mut EmbeddingModel,
+        batch: &MultiMaskBatch<'_>,
+        fbanks: &[Array2<f32>],
+        storage: &mut S,
+    ) -> Result<(), PipelineError> {
         let fbank_refs: Vec<_> = fbanks.iter().collect();
         let num_masks = batch.audio_slices.len() * self.num_speakers;
         let mask_refs: Vec<&[f32]> = batch
@@ -288,7 +511,6 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
             .take(num_masks)
             .collect();
 
-        let predict_start = std::time::Instant::now();
         let batch_embeddings = embedding_model.embed_multi_mask_batch(&fbank_refs, &mask_refs)?;
 
         for (fbank_idx, &chunk_idx) in batch.chunk_indices.iter().enumerate() {
@@ -305,9 +527,7 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
                 );
             }
         }
-        let predict_us = predict_start.elapsed().as_micros() as u64;
-
-        Ok((fbank_us, predict_us))
+        Ok(())
     }
 
     pub fn run_masked(
@@ -467,6 +687,7 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
         })
     }
 
+    #[cfg(feature = "coreml")]
     fn require_num_frames(
         &self,
         num_frames: Option<usize>,

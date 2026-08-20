@@ -3,21 +3,23 @@ use std::path::Path;
 #[cfg(feature = "coreml")]
 use std::sync::Arc;
 
-use ndarray::{Array2, Array3};
 #[cfg(feature = "coreml")]
 use objc2_core_ml::MLComputeUnits;
-use ort::session::{HasSelectedOutputs, RunOptions, Session};
+use ort::session::Session;
 
 #[cfg(feature = "coreml")]
 use crate::inference::coreml::{CachedInputShape, CoreMlModel, SharedCoreMlModel};
-use crate::inference::{ExecutionMode, ModelLoadError};
+use crate::inference::{ExecutionMode, ModelLoadError, share_session};
 
+#[cfg(feature = "coreml")]
 use super::super::{
-    CHUNK_SPEAKER_BATCH_SIZE, EmbeddingBuffers, EmbeddingMeta, EmbeddingModel, FBANK_BATCH_SIZE,
-    FBANK_FEATURES, FBANK_FRAMES, MASK_FRAMES, MULTI_MASK_BATCH_SIZE, NUM_SPEAKERS,
-    OrtEmbeddingState, PRIMARY_BATCH_SIZE, batched_model_path, multi_mask_model_path,
-    preallocated_run_options, read_min_num_samples, split_fbank_batched_model_path,
-    split_fbank_model_path, split_tail_model_path,
+    FBANK_BATCH_SIZE, FBANK_FEATURES, FBANK_FRAMES, MASK_FRAMES, MULTI_MASK_BATCH_SIZE,
+    NUM_SPEAKERS,
+};
+use super::super::{
+    CHUNK_SPEAKER_BATCH_SIZE, EmbeddingBuffers, EmbeddingMeta, EmbeddingModel, OrtEmbeddingState,
+    PRIMARY_BATCH_SIZE, batched_model_path, multi_mask_model_path, read_min_num_samples,
+    split_fbank_batched_model_path, split_fbank_model_path, split_tail_model_path,
 };
 #[cfg(feature = "coreml")]
 use super::super::{ChunkEmbeddingSession, ChunkSessionSpec, CoreMlEmbeddingState};
@@ -26,6 +28,7 @@ pub(super) struct LoadedOrtSessions {
     session: Session,
     primary_batched_session: Option<Session>,
     split_fbank_session: Option<Session>,
+    split_fbank_pool: Vec<Session>,
     split_fbank_batched_session: Option<Session>,
     split_tail_session: Option<Session>,
     split_tail_batched_session: Option<Session>,
@@ -84,13 +87,21 @@ impl LoadedSessions {
             }};
         }
 
+        // diar-native patch: SPEAKRS_LAZY_SESSIONS=1 skips the heavy batched sessions the
+        // CUDA multimask pipeline never executes (fused-b64 primary + batched split tails) —
+        // each idle session pins its own ORT arena (~GBs of VRAM at batch-64 activations).
+        // embed_batch degrades gracefully (per-item path) when primary_batched is absent.
+        let lazy_sessions = std::env::var("SPEAKRS_LAZY_SESSIONS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         let (session, session_elapsed) = timed!(EmbeddingModel::build_session(
             model_path,
             EmbeddingModel::single_execution_mode(mode)
         )?);
         let (primary_batched_session, primary_batched_elapsed) = timed!(
             batched_model_path(model_path, PRIMARY_BATCH_SIZE)
-                .filter(|path| path.exists())
+                .filter(|path| !lazy_sessions && path.exists())
                 .map(|path| EmbeddingModel::build_batched_session(&path, mode))
                 .transpose()?
         );
@@ -116,14 +127,14 @@ impl LoadedSessions {
         let (split_tail_batched_session, split_tail_batched_elapsed) = timed!(
             use_split_backend
                 .then_some(split_tail_batched_path)
-                .filter(|path| path.exists())
+                .filter(|path| !lazy_sessions && path.exists())
                 .map(|path: std::path::PathBuf| EmbeddingModel::build_session(path.as_path(), mode))
                 .transpose()?
         );
         let (split_primary_tail_batched_session, split_primary_tail_batched_elapsed) = timed!(
             use_split_backend
                 .then_some(split_primary_tail_batched_path)
-                .filter(|path| path.exists())
+                .filter(|path| !lazy_sessions && path.exists())
                 .map(|path: std::path::PathBuf| EmbeddingModel::build_session(path.as_path(), mode))
                 .transpose()?
         );
@@ -236,10 +247,29 @@ impl LoadedSessions {
             );
         }
 
+        // diar-native patch: pool of extra CPU fbank sessions for parallel per-chunk fbank
+        // (single-session fbank measured at ~76% of CUDA E2E wall on many-core hosts).
+        let split_fbank_pool: Vec<Session> = if use_split_backend {
+            let pool_size = std::env::var("SPEAKRS_FBANK_POOL")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|c| (c.get() / 4).clamp(1, 8))
+                        .unwrap_or(1)
+                });
+            (0..pool_size)
+                .map(|_| EmbeddingModel::build_fbank_session(&split_fbank_path, ExecutionMode::Cpu))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+
         let ort = LoadedOrtSessions {
             session,
             primary_batched_session,
             split_fbank_session,
+            split_fbank_pool,
             split_fbank_batched_session,
             split_tail_session,
             split_tail_batched_session,
@@ -275,6 +305,7 @@ impl LoadedSessions {
     ) -> Result<EmbeddingModel, ModelLoadError> {
         let metadata_path = model_path.with_extension("min_num_samples.txt");
 
+        let has_primary_batched = self.ort.primary_batched_session.is_some();
         Ok(EmbeddingModel {
             meta: EmbeddingMeta {
                 model_path: model_path.to_path_buf(),
@@ -285,27 +316,30 @@ impl LoadedSessions {
                 min_num_samples: read_min_num_samples(&metadata_path).unwrap_or(400),
             },
             ort: OrtEmbeddingState {
-                session: self.ort.session,
-                primary_batched_session: self.ort.primary_batched_session,
-                split_fbank_session: self.ort.split_fbank_session,
-                split_fbank_batched_session: self.ort.split_fbank_batched_session,
-                split_tail_session: self.ort.split_tail_session,
-                split_tail_batched_session: self.ort.split_tail_batched_session,
-                split_primary_tail_batched_session: self.ort.split_primary_tail_batched_session,
-                multi_mask_session: self.ort.multi_mask_session,
-                multi_mask_batched_session: self.ort.multi_mask_batched_session,
-                primary_batch_run_options: batched_model_path(model_path, PRIMARY_BATCH_SIZE)
-                    .filter(|path| path.exists())
-                    .map(|_| {
-                        let mut opts = preallocated_run_options(
-                            PRIMARY_BATCH_SIZE,
-                            256,
-                            "primary batched embedding output",
-                        )?;
-                        let _ = opts.disable_device_sync();
-                        Ok::<RunOptions<HasSelectedOutputs>, ort::Error>(opts)
-                    })
-                    .transpose()?,
+                session: share_session(self.ort.session),
+                primary_batched_session: self.ort.primary_batched_session.map(share_session),
+                split_fbank_session: self.ort.split_fbank_session.map(share_session),
+                split_fbank_pool: self
+                    .ort
+                    .split_fbank_pool
+                    .into_iter()
+                    .map(share_session)
+                    .collect(),
+                split_fbank_batched_session: self
+                    .ort
+                    .split_fbank_batched_session
+                    .map(share_session),
+                split_tail_session: self.ort.split_tail_session.map(share_session),
+                split_tail_batched_session: self.ort.split_tail_batched_session.map(share_session),
+                split_primary_tail_batched_session: self
+                    .ort
+                    .split_primary_tail_batched_session
+                    .map(share_session),
+                multi_mask_session: self.ort.multi_mask_session.map(share_session),
+                multi_mask_batched_session: self.ort.multi_mask_batched_session.map(share_session),
+                primary_batch_run_options: OrtEmbeddingState::fresh_primary_run_options(
+                    has_primary_batched,
+                )?,
             },
             #[cfg(feature = "coreml")]
             coreml: CoreMlEmbeddingState {
@@ -344,35 +378,7 @@ impl LoadedSessions {
                     &[MULTI_MASK_BATCH_SIZE * NUM_SPEAKERS, MASK_FRAMES],
                 ),
             },
-            buffers: EmbeddingBuffers {
-                multi_mask_fbank_buffer: Array3::zeros((
-                    MULTI_MASK_BATCH_SIZE,
-                    FBANK_FRAMES,
-                    FBANK_FEATURES,
-                )),
-                multi_mask_masks_buffer: Array2::zeros((
-                    MULTI_MASK_BATCH_SIZE * NUM_SPEAKERS,
-                    MASK_FRAMES,
-                )),
-                waveform_buffer: Array3::zeros((1, 1, 160_000)),
-                weights_buffer: Array2::zeros((1, 589)),
-                primary_batch_waveform_buffer: Array3::zeros((PRIMARY_BATCH_SIZE, 1, 160_000)),
-                primary_batch_weights_buffer: Array2::zeros((PRIMARY_BATCH_SIZE, 589)),
-                split_waveform_buffer: Array3::zeros((1, 1, 160_000)),
-                split_fbank_batch_buffer: Array3::zeros((FBANK_BATCH_SIZE, 1, 160_000)),
-                split_feature_batch_buffer: Array3::zeros((
-                    CHUNK_SPEAKER_BATCH_SIZE,
-                    FBANK_FRAMES,
-                    FBANK_FEATURES,
-                )),
-                split_weights_batch_buffer: Array2::zeros((CHUNK_SPEAKER_BATCH_SIZE, 589)),
-                split_primary_feature_batch_buffer: Array3::zeros((
-                    PRIMARY_BATCH_SIZE,
-                    FBANK_FRAMES,
-                    FBANK_FEATURES,
-                )),
-                split_primary_weights_batch_buffer: Array2::zeros((PRIMARY_BATCH_SIZE, 589)),
-            },
+            buffers: EmbeddingBuffers::fresh(),
         })
     }
 }
