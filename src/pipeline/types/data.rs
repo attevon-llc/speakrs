@@ -172,6 +172,14 @@ pub struct DiarizationResult {
     pub discrete_diarization: DiscreteDiarization,
     /// Merged speaker segments (time-stamped speaker turns)
     pub segments: Vec<crate::segment::Segment>,
+    /// Merged speaker segments with at most one speaker at any instant — the
+    /// `exclusive_speaker_diarization` equivalent. Overlapped frames go to the speaker with
+    /// the highest activation score, so the speech is kept rather than split or dropped.
+    pub exclusive_segments: Vec<crate::segment::Segment>,
+    /// Gamma-weighted (un-normalized) speaker centroids from VBx clustering.
+    /// Row index == cluster id used in `hard_clusters` / segment speaker ids.
+    /// Empty (0 rows) when clustering was skipped (no speech / <2 embeddings).
+    pub centroids: Array2<f32>,
 }
 
 impl DiarizationResult {

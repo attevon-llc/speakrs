@@ -21,7 +21,7 @@ impl EmbeddingModel {
     ) -> Result<Session, ort::Error> {
         let builder = Session::builder()?
             .with_independent_thread_pool()?
-            .with_intra_threads(1)?
+            .with_intra_threads(Self::intra_threads())?
             .with_inter_threads(1)?
             .with_memory_pattern(true)?;
         let mut builder =
@@ -58,13 +58,47 @@ impl EmbeddingModel {
         with_execution_mode(builder, ExecutionMode::Cpu)
     }
 
+    /// Intra-op thread count for the embedding ONNX sessions (tail / multimask / primary).
+    ///
+    /// diar-native patch, adopting the approach measured in upstream PR
+    /// avencera/speakrs#6 by @ryoma0421: these sessions hardcoded `intra_threads(1)`,
+    /// which leaves the embedding tail single-threaded and dominates wall time under
+    /// `ExecutionMode::Cpu` (our CPU-only image tier). Under CUDA/CoreML the heavy ops
+    /// are off-CPU, so the extra threads only serve small CPU-side glue nodes.
+    ///
+    /// The cap of 6 matches the already-shipped segmentation session builder
+    /// (`SegmentationModel::build_session`), so the two model families now scale the
+    /// same way. Sessions use independent thread pools and several are built per
+    /// pipeline (tail, multimask, batched variants), but only one embedding session
+    /// executes at a time within a request, so the concurrent thread demand is
+    /// bounded by inflight-requests x 6 rather than sessions x 6. `SPEAKRS_INTRA_THREADS`
+    /// exists to dial that down on small containers or high `DIAR_MAX_INFLIGHT` setups.
+    fn intra_threads() -> usize {
+        std::env::var("SPEAKRS_INTRA_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|count| count.get().min(6))
+                    .unwrap_or(1)
+            })
+    }
+
     pub(super) fn build_fbank_session(
         model_path: &Path,
         mode: ExecutionMode,
     ) -> Result<Session, ort::Error> {
-        let threads = std::thread::available_parallelism()
-            .map(|count| count.get().min(4))
-            .unwrap_or(1);
+        // diar-native patch: default cap of 4 intra-op threads leaves fbank as ~76% of
+        // CUDA E2E wall time on many-core hosts; allow override via SPEAKRS_FBANK_THREADS.
+        let threads = std::env::var("SPEAKRS_FBANK_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|count| count.get().min(4))
+                    .unwrap_or(1)
+            });
         let builder = Session::builder()?
             .with_independent_thread_pool()?
             .with_intra_threads(threads)?
