@@ -299,15 +299,8 @@ pub fn with_execution_mode(
         ExecutionMode::Cuda | ExecutionMode::CudaFast => {
             #[cfg(feature = "cuda")]
             {
-                Ok(builder.with_execution_providers([ep::CUDA::default()
-                    .with_device_id(0)
-                    .with_tf32(true)
-                    .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Exhaustive)
-                    .with_conv_max_workspace(true)
-                    .with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
-                    .with_prefer_nhwc(true)
-                    .build()
-                    .error_on_failure()])?)
+                Ok(builder
+                    .with_execution_providers([cuda_provider().build().error_on_failure()])?)
             }
 
             #[cfg(not(feature = "cuda"))]
@@ -333,12 +326,50 @@ pub fn with_execution_mode(
     }
 }
 
+/// The CUDA EP every speakrs session uses (diar-native patch), with three env overrides:
+///
+/// * `SPEAKRS_CUDA_MEM_LIMIT_MB` — per-session device arena cap (`gpu_mem_limit`); unset/0 = none.
+/// * `SPEAKRS_CUDA_CONV_SEARCH` — `exhaustive` (default) or `heuristic`.
+/// * `SPEAKRS_CUDA_CONV_MAX_WORKSPACE` — `1` (default) or `0`.
+///
+/// Why: exhaustive search with max workspace lets cuDNN pick algorithms whose workspace is
+/// sized off *free* device memory. On Ampere that settles at ~4.6 GB for the whole server; on
+/// an L4 (sm_89) the same build grew the arenas to ~21 GB and starved every co-tenant on the
+/// card. Defaults are unchanged so existing deployments keep their measured speed.
+#[cfg(feature = "cuda")]
+pub fn cuda_provider() -> ep::CUDA {
+    let search = match std::env::var("SPEAKRS_CUDA_CONV_SEARCH").ok().as_deref() {
+        Some(v) if v.eq_ignore_ascii_case("heuristic") => ep::cuda::ConvAlgorithmSearch::Heuristic,
+        _ => ep::cuda::ConvAlgorithmSearch::Exhaustive,
+    };
+    let max_workspace = !matches!(
+        std::env::var("SPEAKRS_CUDA_CONV_MAX_WORKSPACE")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false") | Some("FALSE")
+    );
+    let mut cuda = ep::CUDA::default()
+        .with_device_id(0)
+        .with_tf32(true)
+        .with_conv_algorithm_search(search)
+        .with_conv_max_workspace(max_workspace)
+        .with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
+        .with_prefer_nhwc(true);
+    if let Some(mb) = std::env::var("SPEAKRS_CUDA_MEM_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+    {
+        cuda = cuda.with_memory_limit(mb * 1024 * 1024);
+    }
+    cuda
+}
+
 /// diar-native experiment (speed-handoff lever 4, the 4 GB tier): `SPEAKRS_ARENA_SHRINK=1`
 /// asks ORT to shrink the device arena back to its initial chunk after each run of the big
 /// batched sessions — those arenas (not weights or conv workspace, RESULTS §7.23) are what
 /// holds the ~4 GB idle floor. Costs a re-allocation on the next run; measure both.
-pub(crate) fn arena_shrink_run_options()
--> Result<Option<ort::session::RunOptions>, ort::Error> {
+pub(crate) fn arena_shrink_run_options() -> Result<Option<ort::session::RunOptions>, ort::Error> {
     let enabled = std::env::var("SPEAKRS_ARENA_SHRINK")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
