@@ -37,18 +37,12 @@ impl EmbeddingModel {
     fn with_cuda_graph_mode(
         builder: ort::session::builder::SessionBuilder,
     ) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
-        use ort::ep;
-
-        Ok(builder.with_execution_providers([ep::CUDA::default()
-            .with_device_id(0)
-            .with_tf32(true)
-            .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Exhaustive)
-            .with_conv_max_workspace(true)
-            .with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
-            .with_prefer_nhwc(true)
-            .with_cuda_graph(true)
-            .build()
-            .error_on_failure()])?)
+        Ok(
+            builder.with_execution_providers([crate::inference::cuda_provider()
+                .with_cuda_graph(true)
+                .build()
+                .error_on_failure()])?,
+        )
     }
 
     #[cfg(not(feature = "cuda"))]
